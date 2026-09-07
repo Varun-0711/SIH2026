@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
+import { Device } from "@twilio/voice-sdk";
 
 const API_URL = "http://localhost:8000/analyze-text";
+const VOICE_TOKEN_URL = "http://localhost:8000/voice-token";
 
 const riskStyles = {
   Low: "border-emerald-200 bg-emerald-50 text-emerald-700",
@@ -61,7 +63,7 @@ function PageHeader({ view, onViewChange }) {
   );
 }
 
-function ChatView({ messages, onSubmitMessage, isSending }) {
+function ChatView({ messages, onSubmitMessage, isSending, onStartCall, voiceStatus, voiceError }) {
   const [message, setMessage] = useState("");
   const historyEndRef = useRef(null);
 
@@ -108,6 +110,22 @@ function ChatView({ messages, onSubmitMessage, isSending }) {
             <div ref={historyEndRef} />
           </div>
         )}
+      </div>
+
+      <div className="border-t border-slate-100 bg-slate-50/80 px-4 pt-4 sm:px-5 sm:pt-5">
+        <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-teal-100 bg-teal-50/70 px-4 py-3">
+          <button
+            type="button"
+            onClick={onStartCall}
+            disabled={voiceStatus === "connecting" || voiceStatus === "recording"}
+            className="rounded-xl bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+          >
+            {voiceStatus === "connecting" ? "Connecting..." : "Start Demo Call"}
+          </button>
+          {voiceStatus === "recording" && <span className="text-sm font-medium text-teal-800">Recording — speak now</span>}
+          {voiceStatus === "ended" && !voiceError && <span className="text-sm font-medium text-slate-600">Call ended</span>}
+          {voiceError && <span className="text-sm font-medium text-red-600">{voiceError}</span>}
+        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="border-t border-slate-100 bg-slate-50/80 p-4 sm:p-5">
@@ -208,7 +226,10 @@ function CaseDashboard({ messages }) {
                 filteredMessages.map((item) => (
                   <tr key={item.id} className="align-top transition hover:bg-slate-50/70">
                     <td className="whitespace-nowrap px-4 py-4 text-xs text-slate-500">{new Date(item.timestamp).toLocaleString()}</td>
-                    <td className="max-w-[220px] px-4 py-4 font-medium text-slate-700" title={item.text}>{truncateMessage(item.text)}</td>
+                    <td className="max-w-[220px] px-4 py-4 font-medium text-slate-700" title={item.text}>
+                      {truncateMessage(item.text)}
+                      {item.source && <span className="mt-1 block text-[11px] font-normal uppercase tracking-wide text-slate-400">{item.source}</span>}
+                    </td>
                     <td className="px-4 py-4 font-display font-bold text-slate-800">{item.sviScore ?? "-"}</td>
                     <td className="px-4 py-4"><RiskBadge category={item.riskCategory} /></td>
                     <td className="max-w-[180px] px-4 py-4 text-xs text-slate-600">{item.flags?.join(", ") || "None"}</td>
@@ -227,11 +248,76 @@ function CaseDashboard({ messages }) {
 function App() {
   const [view, setView] = useState("chat");
   const [messages, setMessages] = useState([]);
+  const [voiceCases, setVoiceCases] = useState([]);
   const [isSending, setIsSending] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState("idle");
+  const [voiceError, setVoiceError] = useState("");
+  const voiceDeviceRef = useRef(null);
+  const voiceCallRef = useRef(null);
+
+  useEffect(() => {
+    if (view !== "dashboard") return undefined;
+
+    let active = true;
+    async function loadVoiceCases() {
+      try {
+        const response = await fetch("http://localhost:8000/voice-cases");
+        if (response.ok && active) setVoiceCases(await response.json());
+      } catch {
+        // The dashboard continues to show local chat cases if the backend is unavailable.
+      }
+    }
+
+    loadVoiceCases();
+    const interval = window.setInterval(loadVoiceCases, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [view]);
+
+  async function handleStartCall() {
+    setVoiceError("");
+    setVoiceStatus("connecting");
+
+    try {
+      const response = await fetch(VOICE_TOKEN_URL);
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || "Unable to get a Twilio access token.");
+      }
+
+      const { token } = await response.json();
+      const device = new Device(token);
+      voiceDeviceRef.current = device;
+      device.on("error", (error) => {
+        setVoiceError(error.message || "The browser call failed.");
+        setVoiceStatus("ended");
+      });
+
+      const call = await device.connect();
+      voiceCallRef.current = call;
+      call.on("accept", () => setVoiceStatus("recording"));
+      call.on("disconnect", () => {
+        setVoiceStatus("ended");
+        voiceCallRef.current = null;
+        device.destroy();
+      });
+      call.on("cancel", () => setVoiceStatus("ended"));
+      call.on("reject", () => setVoiceStatus("ended"));
+      call.on("error", (error) => {
+        setVoiceError(error.message || "The browser call failed.");
+        setVoiceStatus("ended");
+      });
+    } catch (error) {
+      setVoiceError(error.message || "Unable to start the demo call.");
+      setVoiceStatus("ended");
+    }
+  }
 
   async function handleSubmitMessage(text) {
     const id = crypto.randomUUID();
-    setMessages((current) => [...current, { id, text, timestamp: new Date().toISOString(), loading: true }]);
+    setMessages((current) => [...current, { id, text, source: "Chat", timestamp: new Date().toISOString(), loading: true }]);
     setIsSending(true);
 
     try {
@@ -259,14 +345,23 @@ function App() {
     }
   }
 
+  const dashboardMessages = [...messages, ...voiceCases];
+
   return (
     <main className="min-h-screen bg-[#f7f4ef] px-4 py-6 text-slate-900 sm:px-6 sm:py-10">
       <section className="mx-auto flex min-h-[calc(100vh-3rem)] max-w-7xl flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-xl shadow-slate-900/5 sm:min-h-[calc(100vh-5rem)]">
         <PageHeader view={view} onViewChange={setView} />
         {view === "chat" ? (
-          <ChatView messages={messages} onSubmitMessage={handleSubmitMessage} isSending={isSending} />
+          <ChatView
+            messages={messages}
+            onSubmitMessage={handleSubmitMessage}
+            isSending={isSending}
+            onStartCall={handleStartCall}
+            voiceStatus={voiceStatus}
+            voiceError={voiceError}
+          />
         ) : (
-          <CaseDashboard messages={messages} />
+          <CaseDashboard messages={dashboardMessages} />
         )}
       </section>
     </main>
